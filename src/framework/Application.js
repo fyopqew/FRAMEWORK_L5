@@ -24,9 +24,6 @@ class Framework {
       Object.keys(endpoint).forEach((method) => {
         this.emitter.on(this._getRouteMask(path, method), async (req, res) => {
           try {
-            for (const middleware of this.middlewares) {
-              await new Promise((resolve) => middleware(req, res, resolve));
-            }
             endpoint[method](req, res);
           } catch (error) {
             res.status(500).json({ error: "Internal Server Error", details: error.message });
@@ -67,12 +64,12 @@ class Framework {
   }
 
   _createServer() {
-    return http.createServer(async (req, res) => {
+    return http.createServer((req, res) => {
       const parsedUrl = url.parse(req.url, true);
       req.query = parsedUrl.query;
       req.params = {};
-
       let body = "";
+
       req.on("data", (chunk) => {
         body += chunk;
       });
@@ -86,45 +83,61 @@ class Framework {
 
         this._extendResponse(res);
 
-        let emitted = false;
+        const middlewareChain = [...this.middlewares];
+        let index = 0;
 
-        for (const eventName of this.emitter.eventNames()) {
-          const [registeredPath, registeredMethod] = eventName
-            .slice(1, -1)
-            .split("]:[");
-
-          if (req.method !== registeredMethod) continue;
-
-          const paramNames = registeredPath.split("/");
-          const urlParts = parsedUrl.pathname.split("/");
-
-          if (paramNames.length !== urlParts.length) continue;
-
-          let match = true;
-          const params = {};
-
-          for (let i = 0; i < paramNames.length; i++) {
-            if (paramNames[i].startsWith(":")) {
-              params[paramNames[i].slice(1)] = urlParts[i];
-            } else if (paramNames[i] !== urlParts[i]) {
-              match = false;
-              break;
-            }
+        const next = () => {
+          if (index < middlewareChain.length) {
+            const middleware = middlewareChain[index++];
+            middleware(req, res, next);
+          } else {
+            this._handleRouting(parsedUrl, req, res);
           }
+        };
 
-          if (match) {
-            req.params = params;
-            this.emitter.emit(eventName, req, res);
-            emitted = true;
-            break;
-          }
-        }
-
-        if (!emitted) {
-          res.status(404).json({ error: "Not found" });
-        }
+        next();
       });
     });
+  }
+
+  _handleRouting(parsedUrl, req, res) {
+    let emitted = false;
+
+    for (const eventName of this.emitter.eventNames()) {
+      const [registeredPath, registeredMethod] = eventName
+        .slice(1, -1)
+        .split("]:[");
+
+      if (req.method !== registeredMethod) continue;
+
+      const paramNames = registeredPath.split("/");
+      const urlParts = parsedUrl.pathname.split("/");
+
+      if (paramNames.length !== urlParts.length) continue;
+
+      let match = true;
+      const params = {};
+
+      for (let i = 0; i < paramNames.length; i++) {
+        if (paramNames[i].startsWith(":")) {
+          params[paramNames[i].slice(1)] = urlParts[i];
+        } else if (paramNames[i] !== urlParts[i]) {
+          match = false;
+          break;
+        }
+      }
+
+      if (match) {
+        req.params = params;
+        this.emitter.emit(eventName, req, res);
+        emitted = true;
+        break;
+      }
+    }
+
+    if (!emitted) {
+      res.status(404).json({ error: "Not found" });
+    }
   }
 
   _extendResponse(res) {

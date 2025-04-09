@@ -1,5 +1,7 @@
 const EventEmitter = require("events");
 const http = require("http");
+const url = require("url");
+const Router = require("./Router.js");
 
 class Framework {
   constructor() {
@@ -17,41 +19,124 @@ class Framework {
   }
 
   addRouter(router) {
-    Object.keys(router).forEach((path) => {
+    Object.keys(router.endpoints).forEach((path) => {
       const endpoint = router.endpoints[path];
       Object.keys(endpoint).forEach((method) => {
-        this.emitter.on(this._getRouteMask(req.url, req.method), (req, res) => {
-          const handler = endpoint[method];
-          handler(req, res);
+        this.emitter.on(this._getRouteMask(path, method), async (req, res) => {
+          try {
+            for (const middleware of this.middlewares) {
+              await new Promise((resolve) => middleware(req, res, resolve));
+            }
+            endpoint[method](req, res);
+          } catch (error) {
+            res.status(500).json({ error: "Internal Server Error", details: error.message });
+          }
         });
       });
     });
   }
 
-  _createServer() {
-    return http.createServer((req, res) => {
-      let body = "";
+  get(path, handler) {
+    const r = new Router();
+    r.get(path, handler);
+    this.addRouter(r);
+  }
 
-      req.on("data", (chunck) => {
-        body += chunck;
+  post(path, handler) {
+    const r = new Router();
+    r.post(path, handler);
+    this.addRouter(r);
+  }
+
+  put(path, handler) {
+    const r = new Router();
+    r.put(path, handler);
+    this.addRouter(r);
+  }
+
+  patch(path, handler) {
+    const r = new Router();
+    r.patch(path, handler);
+    this.addRouter(r);
+  }
+
+  delete(path, handler) {
+    const r = new Router();
+    r.delete(path, handler);
+    this.addRouter(r);
+  }
+
+  _createServer() {
+    return http.createServer(async (req, res) => {
+      const parsedUrl = url.parse(req.url, true);
+      req.query = parsedUrl.query;
+      req.params = {};
+
+      let body = "";
+      req.on("data", (chunk) => {
+        body += chunk;
       });
 
       req.on("end", () => {
-        if (body) req.body = JSON.parse(body);
+        try {
+          req.body = body ? JSON.parse(body) : {};
+        } catch {
+          req.body = {};
+        }
 
-        this.middlewares.forEach((middleware) => middleware(req, res));
+        this._extendResponse(res);
 
-        const emitted = this.emitter.emit(
-          this._getRouteMask(req.url, req.method),
-          req,
-          res
-        );
+        let emitted = false;
+
+        for (const eventName of this.emitter.eventNames()) {
+          const [registeredPath, registeredMethod] = eventName
+            .slice(1, -1)
+            .split("]:[");
+
+          if (req.method !== registeredMethod) continue;
+
+          const paramNames = registeredPath.split("/");
+          const urlParts = parsedUrl.pathname.split("/");
+
+          if (paramNames.length !== urlParts.length) continue;
+
+          let match = true;
+          const params = {};
+
+          for (let i = 0; i < paramNames.length; i++) {
+            if (paramNames[i].startsWith(":")) {
+              params[paramNames[i].slice(1)] = urlParts[i];
+            } else if (paramNames[i] !== urlParts[i]) {
+              match = false;
+              break;
+            }
+          }
+
+          if (match) {
+            req.params = params;
+            this.emitter.emit(eventName, req, res);
+            emitted = true;
+            break;
+          }
+        }
 
         if (!emitted) {
-          res.end();
+          res.status(404).json({ error: "Not found" });
         }
       });
     });
+  }
+
+  _extendResponse(res) {
+    res.send = (data) => res.end(data);
+    res.json = (data) => {
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(data));
+    };
+    res.status = (code) => {
+      res.statusCode = code;
+      return res;
+    };
   }
 
   _getRouteMask(path, method) {
